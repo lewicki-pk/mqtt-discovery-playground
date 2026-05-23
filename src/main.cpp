@@ -1,19 +1,17 @@
-#include <arpa/inet.h>
+#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <netdb.h>
+#include <mqtt/client.h>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <sys/socket.h>
 #include <thread>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -324,165 +322,56 @@ std::optional<ThermalReading> find_cpu_temperature(const std::string& requested_
     return hottest;
 }
 
-class TcpSocket {
+std::string mqtt_server_uri(const Config& config) {
+    return "tcp://" + config.host + ":" + std::to_string(config.port);
+}
+
+class MqttPublisher {
 public:
-    ~TcpSocket() {
-        close();
-    }
-
-    void connect_to(const std::string& host, int port) {
-        close();
-
-        struct addrinfo hints {};
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-
-        struct addrinfo* result = nullptr;
-        const std::string port_text = std::to_string(port);
-        int rc = getaddrinfo(host.c_str(), port_text.c_str(), &hints, &result);
-        if (rc != 0) {
-            throw std::runtime_error("getaddrinfo failed: " + std::string(gai_strerror(rc)));
-        }
-
-        for (struct addrinfo* addr = result; addr != nullptr; addr = addr->ai_next) {
-            fd_ = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
-            if (fd_ < 0) {
-                continue;
-            }
-            if (::connect(fd_, addr->ai_addr, addr->ai_addrlen) == 0) {
-                freeaddrinfo(result);
-                return;
-            }
-            ::close(fd_);
-            fd_ = -1;
-        }
-
-        freeaddrinfo(result);
-        throw std::runtime_error("Could not connect to MQTT broker at " + host + ":" + port_text);
-    }
-
-    void send_all(const std::vector<std::uint8_t>& data) {
-        std::size_t offset = 0;
-        while (offset < data.size()) {
-            ssize_t written = ::send(fd_, data.data() + offset, data.size() - offset, 0);
-            if (written <= 0) {
-                throw std::runtime_error("Socket send failed");
-            }
-            offset += static_cast<std::size_t>(written);
-        }
-    }
-
-    std::vector<std::uint8_t> recv_exact(std::size_t bytes) {
-        std::vector<std::uint8_t> data(bytes);
-        std::size_t offset = 0;
-        while (offset < bytes) {
-            ssize_t received = ::recv(fd_, data.data() + offset, bytes - offset, 0);
-            if (received <= 0) {
-                throw std::runtime_error("Socket receive failed");
-            }
-            offset += static_cast<std::size_t>(received);
-        }
-        return data;
-    }
-
-    void close() {
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
-    }
-
-private:
-    int fd_ = -1;
-};
-
-void append_u16(std::vector<std::uint8_t>& data, std::uint16_t value) {
-    data.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFFu));
-    data.push_back(static_cast<std::uint8_t>(value & 0xFFu));
-}
-
-void append_string(std::vector<std::uint8_t>& data, const std::string& value) {
-    append_u16(data, static_cast<std::uint16_t>(value.size()));
-    data.insert(data.end(), value.begin(), value.end());
-}
-
-void append_remaining_length(std::vector<std::uint8_t>& packet, std::size_t length) {
-    do {
-        std::uint8_t encoded = static_cast<std::uint8_t>(length % 128);
-        length /= 128;
-        if (length > 0) {
-            encoded |= 0x80u;
-        }
-        packet.push_back(encoded);
-    } while (length > 0);
-}
-
-class MqttClient {
-public:
-    explicit MqttClient(Config config) : config_(std::move(config)) {}
+    explicit MqttPublisher(const Config& config)
+        : client_(mqtt_server_uri(config), config.client_id),
+          connect_options_(build_connect_options(config)) {}
 
     void connect() {
-        socket_.connect_to(config_.host, config_.port);
-
-        std::vector<std::uint8_t> variable_header_and_payload;
-        append_string(variable_header_and_payload, "MQTT");
-        variable_header_and_payload.push_back(0x04);  // MQTT 3.1.1
-
-        std::uint8_t connect_flags = 0x02;  // clean session
-        if (!config_.username.empty()) {
-            connect_flags |= 0x80;
-        }
-        if (!config_.password.empty()) {
-            connect_flags |= 0x40;
-        }
-        variable_header_and_payload.push_back(connect_flags);
-
-        const int keep_alive = std::max(60, config_.interval_seconds * 3);
-        append_u16(variable_header_and_payload, static_cast<std::uint16_t>(keep_alive));
-
-        append_string(variable_header_and_payload, config_.client_id);
-        if (!config_.username.empty()) {
-            append_string(variable_header_and_payload, config_.username);
-        }
-        if (!config_.password.empty()) {
-            append_string(variable_header_and_payload, config_.password);
-        }
-
-        std::vector<std::uint8_t> packet;
-        packet.push_back(0x10);
-        append_remaining_length(packet, variable_header_and_payload.size());
-        packet.insert(packet.end(), variable_header_and_payload.begin(), variable_header_and_payload.end());
-        socket_.send_all(packet);
-
-        auto header = socket_.recv_exact(4);
-        if (header[0] != 0x20 || header[1] != 0x02 || header[3] != 0x00) {
-            throw std::runtime_error("MQTT CONNACK rejected with return code " + std::to_string(header[3]));
+        if (!client_.is_connected()) {
+            client_.connect(connect_options_);
         }
     }
 
     void publish(const std::string& topic, const std::string& payload, bool retain) {
-        std::vector<std::uint8_t> body;
-        append_string(body, topic);
-        body.insert(body.end(), payload.begin(), payload.end());
-
-        std::vector<std::uint8_t> packet;
-        packet.push_back(static_cast<std::uint8_t>(0x30 | (retain ? 0x01 : 0x00)));
-        append_remaining_length(packet, body.size());
-        packet.insert(packet.end(), body.begin(), body.end());
-        socket_.send_all(packet);
+        client_.publish(topic, payload.data(), payload.size(), kQos, retain);
     }
 
     void disconnect() {
         try {
-            socket_.send_all({0xE0, 0x00});
+            if (client_.is_connected()) {
+                client_.disconnect();
+            }
         } catch (...) {
         }
-        socket_.close();
     }
 
 private:
-    Config config_;
-    TcpSocket socket_;
+    static mqtt::connect_options build_connect_options(const Config& config) {
+        mqtt::connect_options options;
+        options.set_clean_session(true);
+        options.set_keep_alive_interval(std::chrono::seconds(std::max(60, config.interval_seconds * 3)));
+        options.set_connect_timeout(std::chrono::seconds(10));
+
+        if (!config.username.empty()) {
+            options.set_user_name(config.username);
+        }
+        if (!config.password.empty()) {
+            options.set_password(config.password);
+        }
+
+        return options;
+    }
+
+    static constexpr int kQos = 1;
+
+    mqtt::client client_;
+    mqtt::connect_options connect_options_;
 };
 
 std::string default_state_topic(const Config& config) {
@@ -537,6 +426,7 @@ int main(int argc, char** argv) {
 
         const std::string config_topic = discovery_topic(config);
         const std::string config_payload = discovery_payload(config, config.state_topic);
+        MqttPublisher mqtt(config);
 
         bool published_discovery = false;
 
@@ -547,7 +437,6 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("No usable thermal zone found under /sys/class/thermal");
                 }
 
-                MqttClient mqtt(config);
                 mqtt.connect();
 
                 if (!published_discovery) {
@@ -558,13 +447,12 @@ int main(int argc, char** argv) {
 
                 const std::string state_payload = format_temperature(reading->celsius);
                 mqtt.publish(config.state_topic, state_payload, true);
-                mqtt.disconnect();
-
                 std::cerr
                     << "Published " << state_payload << " C from "
                     << reading->zone_name << " (" << reading->zone_type << ")"
                     << " to " << config.state_topic << "\n";
             } catch (const std::exception& ex) {
+                mqtt.disconnect();
                 published_discovery = false;
                 std::cerr << "Publish attempt failed: " << ex.what() << "\n";
             }
@@ -573,6 +461,8 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
         }
+
+        mqtt.disconnect();
     } catch (const std::exception& ex) {
         std::cerr << "Fatal error: " << ex.what() << "\n";
         return 1;
