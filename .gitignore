@@ -1,0 +1,6 @@
+cpu_temp_mqtt
+.codex
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
